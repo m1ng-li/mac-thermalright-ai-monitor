@@ -16,20 +16,23 @@ macOS, no Windows required.
 Pikachu hops and crackles with CPU load, clock ticks.</sub>
 
 > Fork of [beret21/MacTR](https://github.com/beret21/MacTR), reworked around a central
-> **AI Agents** panel that tracks [Claude Code](https://claude.com/claude-code) and
-> [Codex](https://openai.com/codex) sessions in real time.
+> **AI Agents** panel that tracks [Claude Code](https://claude.com/claude-code),
+> [Codex](https://openai.com/codex) and [Cursor](https://cursor.com) sessions in real time.
+> Either column can be remapped in Settings.
 
 ## Highlights
 
 ### 🤖 AI Agents panel
-Reads your **local** Claude Code and Codex session logs (read-only, no network) and shows,
-for each agent, side by side:
+Reads your **local** Claude Code / Codex / Cursor session logs (read-only, no network).
+Defaults to Cursor on the left and Codex on the right; remap either column to Claude,
+Codex or Cursor from the menu bar or **Settings → Agents**:
 
 - **Current project** and the **last thing it said** — Markdown tables in the message are
   rendered as real aligned tables, not raw `| … |` text.
 - **Plan / step progress** — `步骤 4/6` badge + a segmented progress bar, parsed from
-  Codex `update_plan` and Claude `TodoWrite`. Stale plans from a finished turn disappear.
-- **Today's token usage** — total + In/Out, in a compact `万 / 亿` format.
+  Codex `update_plan` and Claude / Cursor `TodoWrite`. Stale plans from a finished turn disappear.
+- **Today's token usage** — total + In/Out, in a compact `万 / 亿` format (Cursor's local
+  logs don't include usage, so that column shows "—").
 - **Codex remaining quota** — % left + reset countdown, tracked across all recent sessions.
 - **Live status** — the column **breathes** while an agent is working and **flashes** for
   ~10 s when it finishes a turn or needs your input.
@@ -161,6 +164,7 @@ CLIs already write to disk:
 |---|---|---|
 | Claude Code | `~/.claude/projects/*/*.jsonl` | assistant messages, `usage` tokens, `TodoWrite` |
 | Codex | `~/.codex/sessions/YYYY/MM/DD/*.jsonl` | agent messages, `token_count`, `rate_limits`, `update_plan` |
+| Cursor | `~/.cursor/projects/*/agent-transcripts/*/*.jsonl` | assistant messages, `turn_ended`, `TodoWrite` (no token usage) |
 
 Token totals are scoped to the local day; the panel gracefully shows the last session's
 context when an agent hasn't run yet today.

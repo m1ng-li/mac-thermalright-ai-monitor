@@ -13,17 +13,17 @@
 <sub>实时演示(假数据)。两个 agent 都在"工作"→ 面板呼吸、Bongo Cat 敲键盘、皮卡丘随 CPU 负载蹦跳放电、时钟走字。</sub>
 
 > 基于 [beret21/MacTR](https://github.com/beret21/MacTR) 改造,核心是一块实时追踪
-> [Claude Code](https://claude.com/claude-code) 与 [Codex](https://openai.com/codex)
-> 会话的 **AI Agents** 面板。
+> [Claude Code](https://claude.com/claude-code)、[Codex](https://openai.com/codex)
+> 与 [Cursor](https://cursor.com) 会话的 **AI Agents** 面板。左右两列可在设置里自由切换。
 
 ## 亮点
 
 ### 🤖 AI Agents 面板
-读取**本地**的 Claude Code 和 Codex 会话日志(只读、不联网),左右并排显示每个 agent 的:
+读取**本地**的 Claude Code / Codex / Cursor 会话日志(只读、不联网)。默认左侧 Cursor、右侧 Codex,可在菜单栏或 **Settings → Agents** 里把任意一列改成 Claude / Codex / Cursor:
 
 - **当前项目**和**它最后说的话** —— 消息里的 Markdown 表格会被渲染成对齐的表格,而不是原始的 `| … |` 文本。
-- **计划 / 步骤进度** —— `步骤 4/6` 徽章 + 分段进度条,从 Codex 的 `update_plan` 和 Claude 的 `TodoWrite` 解析而来。上一轮已完成的旧计划会自动消失。
-- **今日 Token 用量** —— 总量 + In/Out,用简洁的 `万 / 亿` 格式。
+- **计划 / 步骤进度** —— `步骤 4/6` 徽章 + 分段进度条,从 Codex 的 `update_plan`、Claude / Cursor 的 `TodoWrite` 解析而来。上一轮已完成的旧计划会自动消失。
+- **今日 Token 用量** —— 总量 + In/Out,用简洁的 `万 / 亿` 格式(Cursor 本地日志不含用量,显示「—」)。
 - **Codex 剩余额度** —— 剩余百分比 + 重置倒计时,跨所有近期会话取最新读数。
 - **实时状态** —— agent 工作时该栏**缓慢呼吸**,完成一轮或需要你输入时**闪烁**约 10 秒提醒。
 
@@ -141,6 +141,7 @@ MacTR 从不访问任何网络或 API,只读取这些 CLI 本来就写到本地�
 |---|---|---|
 | Claude Code | `~/.claude/projects/*/*.jsonl` | 助手消息、`usage` token、`TodoWrite` |
 | Codex | `~/.codex/sessions/YYYY/MM/DD/*.jsonl` | agent 消息、`token_count`、`rate_limits`、`update_plan` |
+| Cursor | `~/.cursor/projects/*/agent-transcripts/*/*.jsonl` | 助手消息、`turn_ended`、`TodoWrite`(无 token 用量) |
 
 Token 总量按本地自然日统计;某个 agent 今天还没跑过时,面板会优雅地显示它上一次会话的上下文。
 

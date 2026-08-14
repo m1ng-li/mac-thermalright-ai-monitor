@@ -19,6 +19,10 @@ struct SettingsView: View {
                 displaySettings
             }
 
+            Tab("Agents", systemImage: "cpu") {
+                agentSettings
+            }
+
             Tab("Device", systemImage: "cable.connector") {
                 deviceSettings
             }
@@ -27,7 +31,7 @@ struct SettingsView: View {
                 aboutView
             }
         }
-        .frame(width: 480, height: 340)
+        .frame(width: 480, height: 380)
     }
 
     // MARK: - General Tab
@@ -97,6 +101,40 @@ struct SettingsView: View {
                         state.applySettings()
                     }
                 Text("Enable if display appears upside down")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+        .padding()
+    }
+
+    // MARK: - Agents Tab
+
+    private var agentSettings: some View {
+        Form {
+            Section("AI Agents 面板") {
+                Picker("左侧", selection: $state.leftAgent) {
+                    ForEach(AgentKind.allCases) { kind in
+                        Text(kind.displayName).tag(kind)
+                    }
+                }
+                .onChange(of: state.leftAgent) {
+                    state.applyAgentSelection()
+                }
+
+                Picker("右侧", selection: $state.rightAgent) {
+                    ForEach(AgentKind.allCases) { kind in
+                        Text(kind.displayName).tag(kind)
+                    }
+                }
+                .onChange(of: state.rightAgent) {
+                    state.applyAgentSelection()
+                }
+            }
+
+            Section {
+                Text("中间栏左右两列可分别指定 Claude、Codex 或 Cursor。Cursor 的本地日志不含 token 用量，该列会显示「—」。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

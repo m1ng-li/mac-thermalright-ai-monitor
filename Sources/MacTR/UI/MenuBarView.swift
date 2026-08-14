@@ -53,6 +53,46 @@ struct MenuBarView: View {
 
             Divider()
 
+            // Agent columns
+            Text("AI Agents")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 8)
+
+            Menu("左侧 · \(state.leftAgent.displayName)") {
+                ForEach(AgentKind.allCases) { kind in
+                    Button {
+                        state.leftAgent = kind
+                        state.applyAgentSelection()
+                    } label: {
+                        HStack {
+                            if state.leftAgent == kind {
+                                Image(systemName: "checkmark")
+                            }
+                            Text(kind.displayName)
+                        }
+                    }
+                }
+            }
+
+            Menu("右侧 · \(state.rightAgent.displayName)") {
+                ForEach(AgentKind.allCases) { kind in
+                    Button {
+                        state.rightAgent = kind
+                        state.applyAgentSelection()
+                    } label: {
+                        HStack {
+                            if state.rightAgent == kind {
+                                Image(systemName: "checkmark")
+                            }
+                            Text(kind.displayName)
+                        }
+                    }
+                }
+            }
+
+            Divider()
+
             // Brightness
             HStack {
                 Text("Brightness")

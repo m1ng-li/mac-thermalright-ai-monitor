@@ -3,6 +3,8 @@
 // Set 1: CPU | AI AGENTS (triple width) | MEMORY
 // The AGENTS panel shows each agent's current activity (top) and today's
 // token usage + quota (bottom), sourced from local session transcripts.
+// Left / right columns are freely remappable among Claude / Codex / Cursor
+// via AgentKind.left / AgentKind.right (Settings → Agents).
 
 import AppKit
 import CoreGraphics
@@ -48,7 +50,8 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
                    needsAttention: true,
                    waitingFor: u.waitingFor, model: u.model,
                    stepCurrent: u.stepCurrent, stepTotal: u.stepTotal,
-                   stepText: u.stepText)
+                   stepText: u.stepText,
+                   hasTokenUsage: u.hasTokenUsage)
     }
 
     /// Start background metrics collection. Call before first render().
@@ -95,8 +98,10 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
         // Heavy CPU → Pikachu crackles with electricity, worth animating smoothly
         if let c = _cpu, c.total > 55 { return true }
         guard let a = _agents else { return false }
-        return a.claude.isWorking || a.claude.needsAttention
-            || a.codex.isWorking || a.codex.needsAttention
+        let left = a.usage(for: AgentKind.left)
+        let right = a.usage(for: AgentKind.right)
+        return left.isWorking || left.needsAttention
+            || right.isWorking || right.needsAttention
     }
 
     private func metricsLoop() {
@@ -191,7 +196,24 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
                               quotaResetsAt: Date().addingTimeInterval(3600 * 24 * 6),
                               isWorking: true,
                               stepCurrent: 4, stepTotal: 6,
-                              stepText: "部署到预发环境并跑冒烟测试"))
+                              stepText: "部署到预发环境并跑冒烟测试"),
+            cursor: AgentUsage(available: true,
+                               todayInputTokens: 0, todayOutputTokens: 0,
+                               secondsSinceActive: 4, project: "ad-test-mini",
+                               activity: """
+                               落地页已填好并发布，公开链接与编辑器画布样式对齐。
+
+                               | 页面 | 状态 |
+                               |---|---|
+                               | 编辑器 | 已刷新 |
+                               | 公开 H5 | 样式匹配 |
+                               """,
+                               quotaUsedPercent: 48,
+                               isWorking: true,
+                               model: "gpt-5.6-sol",
+                               stepCurrent: 2, stepTotal: 3,
+                               stepText: "核对公开页样式",
+                               hasTokenUsage: false))
         return (cpu, mem, temp, sys, agents)
     }
 
@@ -238,7 +260,8 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
 
         if let until = testFlashUntil, Date() < until {
             agents = AgentsSnapshot(claude: withAttention(agents.claude),
-                                    codex: withAttention(agents.codex))
+                                    codex: withAttention(agents.codex),
+                                    cursor: withAttention(agents.cursor))
         }
 
         // Reuse CGContext to prevent CG raster data memory growth
@@ -262,9 +285,11 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
         // Background
         Draw.gradientBackground(ctx)
 
-        // Panels
-        let agentsBusy = agents.claude.isWorking || agents.claude.needsAttention
-            || agents.codex.isWorking || agents.codex.needsAttention
+        // Panels — only the two currently displayed columns drive the pets
+        let leftU = agents.usage(for: AgentKind.left)
+        let rightU = agents.usage(for: AgentKind.right)
+        let agentsBusy = leftU.isWorking || leftU.needsAttention
+            || rightU.isWorking || rightU.needsAttention
         renderCPU(ctx, cpu: cpu, temp: temp, agentsBusy: agentsBusy)
         renderAgents(ctx, agents: agents)
         renderMemory(ctx, mem: mem, sys: sys, agentsBusy: agentsBusy)
@@ -646,10 +671,22 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
                   to: CGPoint(x: midX, y: py + ph - 14), color: Color.border)
 
         let colW = pw / 2 - 40
+        let left = AgentKind.left
+        let right = AgentKind.right
         renderAgentColumn(ctx, x: x + 22, w: colW, py: py,
-                          name: "CLAUDE", accent: Color.claude, usage: agents.claude)
+                          name: left.columnName, accent: accentColor(for: left),
+                          usage: agents.usage(for: left))
         renderAgentColumn(ctx, x: midX + 18, w: colW, py: py,
-                          name: "CODEX", accent: Color.cyan, usage: agents.codex)
+                          name: right.columnName, accent: accentColor(for: right),
+                          usage: agents.usage(for: right))
+    }
+
+    private func accentColor(for kind: AgentKind) -> CGColor {
+        switch kind {
+        case .claude: return Color.claude
+        case .codex:  return Color.cyan
+        case .cursor: return Color.cursor
+        }
     }
 
     private func renderAgentColumn(_ ctx: CGContext, x: Int, w: Int, py: Int,
@@ -665,6 +702,7 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
                             width: CGFloat(w + 24), height: CGFloat(ph - 56))
         let bgPath = CGPath(roundedRect: bgRect, cornerWidth: 12, cornerHeight: 12,
                             transform: nil)
+        // Claude's terracotta needs a hair more base alpha to read on the dark panel
         let base: CGFloat = name == "CLAUDE" ? 0.09 : 0.08
         let t = Date().timeIntervalSince1970
         let blinkOn = Int(t * 2) % 2 == 0
@@ -797,45 +835,67 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
                   to: CGPoint(x: x + w, y: tokY - 12), color: Color.border)
         Draw.text(ctx, "今日 Token", x: x, y: tokY,
                   font: Fonts.system(19), color: Color.textL)
-        Draw.text(ctx, formatTokensCN(usage.todayTotalTokens), x: x, y: tokY + 24,
-                  font: Fonts.system(46, weight: .bold), color: Color.textW)
+        if usage.hasTokenUsage {
+            Draw.text(ctx, formatTokensCN(usage.todayTotalTokens), x: x, y: tokY + 24,
+                      font: Fonts.system(46, weight: .bold), color: Color.textW)
 
-        // In / Out — right-aligned, level with the label + big number
-        let ioFont = Fonts.system(20, weight: .medium)
-        let ioRows: [(String, UInt64)] = [
-            ("In", usage.todayInputTokens),
-            ("Out", usage.todayOutputTokens),
-        ]
-        for (i, row) in ioRows.enumerated() {
-            let ry = tokY + 6 + i * 30
-            let valStr = formatTokensCN(row.1)
-            let valW = (valStr as NSString).size(withAttributes: [.font: ioFont]).width
-            Draw.text(ctx, valStr, x: Int(CGFloat(x + w) - valW), y: ry,
-                      font: ioFont, color: Color.textS)
-            let labelW = (row.0 as NSString).size(withAttributes: [.font: ioFont]).width
-            Draw.text(ctx, row.0, x: Int(CGFloat(x + w) - valW - labelW - 10), y: ry,
-                      font: ioFont, color: Color.textL)
+            // In / Out — right-aligned, level with the label + big number
+            let ioFont = Fonts.system(20, weight: .medium)
+            let ioRows: [(String, UInt64)] = [
+                ("In", usage.todayInputTokens),
+                ("Out", usage.todayOutputTokens),
+            ]
+            for (i, row) in ioRows.enumerated() {
+                let ry = tokY + 6 + i * 30
+                let valStr = formatTokensCN(row.1)
+                let valW = (valStr as NSString).size(withAttributes: [.font: ioFont]).width
+                Draw.text(ctx, valStr, x: Int(CGFloat(x + w) - valW), y: ry,
+                          font: ioFont, color: Color.textS)
+                let labelW = (row.0 as NSString).size(withAttributes: [.font: ioFont]).width
+                Draw.text(ctx, row.0, x: Int(CGFloat(x + w) - valW - labelW - 10), y: ry,
+                          font: ioFont, color: Color.textL)
+            }
+        } else {
+            // Cursor (and any future source) never writes per-message usage
+            Draw.text(ctx, "—", x: x, y: tokY + 24,
+                      font: Fonts.system(46, weight: .bold), color: Color.textD)
+            Draw.text(ctx, "无日用量 · 见上下文", x: x + 70, y: tokY + 42,
+                      font: Fonts.system(17), color: Color.textL)
         }
 
-        // Quota (Codex): remaining percentage + reset countdown + bar
+        // Bottom bar: Codex remaining quota, or Cursor context-window fill.
+        // `quotaUsedPercent` is "used" in both cases; Codex flips it to remaining.
         if let used = usage.quotaUsedPercent {
-            let remaining = max(0, 100 - used)
-            let qColor: CGColor = remaining > 50 ? Color.green
-                : (remaining > 20 ? Color.orange : Color.red)
             let qy = tokY + 78
-            Draw.text(ctx, String(format: "剩余额度 %.0f%%", remaining), x: x, y: qy,
-                      font: Fonts.system(21, weight: .medium), color: qColor)
-            if let resets = usage.quotaResetsAt {
-                let secs = max(0, Int(resets.timeIntervalSinceNow))
-                let resetStr = secs >= 86400 ? "\(secs / 86400)天后重置"
-                    : (secs >= 3600 ? "\(secs / 3600)小时后重置" : "\(max(secs / 60, 1))分钟后重置")
-                let rFont = Fonts.system(17)
-                let rW = (resetStr as NSString).size(withAttributes: [.font: rFont]).width
-                Draw.text(ctx, resetStr, x: Int(CGFloat(x + w) - rW), y: qy + 3,
-                          font: rFont, color: Color.textD)
+            if usage.hasTokenUsage {
+                // Codex subscription window — show remaining
+                let remaining = max(0, 100 - used)
+                let qColor: CGColor = remaining > 50 ? Color.green
+                    : (remaining > 20 ? Color.orange : Color.red)
+                Draw.text(ctx, String(format: "剩余额度 %.0f%%", remaining), x: x, y: qy,
+                          font: Fonts.system(21, weight: .medium), color: qColor)
+                if let resets = usage.quotaResetsAt {
+                    let secs = max(0, Int(resets.timeIntervalSinceNow))
+                    let resetStr = secs >= 86400 ? "\(secs / 86400)天后重置"
+                        : (secs >= 3600 ? "\(secs / 3600)小时后重置"
+                           : "\(max(secs / 60, 1))分钟后重置")
+                    let rFont = Fonts.system(17)
+                    let rW = (resetStr as NSString).size(withAttributes: [.font: rFont]).width
+                    Draw.text(ctx, resetStr, x: Int(CGFloat(x + w) - rW), y: qy + 3,
+                              font: rFont, color: Color.textD)
+                }
+                Draw.bar(ctx, x: x, y: qy + 28, w: w, h: 8,
+                         percent: remaining, color: qColor)
+            } else {
+                // Cursor — context window fill of the active chat (not a daily total)
+                let fill = min(max(used, 0), 100)
+                let qColor: CGColor = fill < 50 ? Color.cursor
+                    : (fill < 80 ? Color.orange : Color.red)
+                Draw.text(ctx, String(format: "上下文 %.0f%%", fill), x: x, y: qy,
+                          font: Fonts.system(21, weight: .medium), color: qColor)
+                Draw.bar(ctx, x: x, y: qy + 28, w: w, h: 8,
+                         percent: fill, color: qColor)
             }
-            Draw.bar(ctx, x: x, y: qy + 28, w: w, h: 8,
-                     percent: remaining, color: qColor)
         }
     }
 
@@ -947,8 +1007,13 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
     }
 
     private func stripMarkdown(_ s: String) -> String {
-        s.replacingOccurrences(of: "`", with: "")
+        var t = s.replacingOccurrences(of: "`", with: "")
             .replacingOccurrences(of: "**", with: "")
+        // Drop leading ATX heading markers ("## 标题" → "标题")
+        if t.hasPrefix("#") {
+            t = String(t.drop(while: { $0 == "#" || $0 == " " }))
+        }
+        return t
     }
 
     /// Render markdown table rows as an aligned grid. Returns the new y below it.

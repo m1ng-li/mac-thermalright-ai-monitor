@@ -54,6 +54,10 @@ final class AppState {
     var refreshInterval: Double = 0.5
     var rotateDisplay: Bool = false
 
+    // AI Agents panel — which source fills each column
+    var leftAgent: AgentKind = AgentKind.left
+    var rightAgent: AgentKind = AgentKind.right
+
     // Metrics (for menu bar display)
     var frameCount = 0
     var lastFrameSize = 0
@@ -107,6 +111,13 @@ final class AppState {
     /// Called when user changes display set, brightness, or interval
     func applySettings() {
         engine?.updateSettings(set: currentSet, brightness: brightness, interval: refreshInterval, rotate: rotateDisplay)
+    }
+
+    /// Persist the AI Agents column mapping. The renderer reads AgentKind.left /
+    /// AgentKind.right on the next frame, so no engine restart is needed.
+    func applyAgentSelection() {
+        AgentKind.left = leftAgent
+        AgentKind.right = rightAgent
     }
 
     /// Latest rendered frame for the on-Mac preview window

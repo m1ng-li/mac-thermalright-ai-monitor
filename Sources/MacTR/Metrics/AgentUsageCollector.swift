@@ -1,9 +1,10 @@
-// AgentUsageCollector.swift — Claude Code / Codex CLI usage collection
+// AgentUsageCollector.swift — Claude Code / Codex / Cursor usage collection
 //
 // Parses local session transcripts to report today's token usage and the
 // agent's latest activity. No subprocess, no network:
 //   Claude: ~/.claude/projects/<proj>/<session>.jsonl — per-message "usage"
 //   Codex:  ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl — "token_count" events
+//   Cursor: ~/.cursor/projects/<proj>/agent-transcripts/<id>/<id>.jsonl
 //
 // Files are read incrementally (per-file byte offsets) so the steady-state
 // cost per tick is a stat() per candidate file plus any appended bytes —
@@ -11,6 +12,51 @@
 
 import Darwin
 import Foundation
+
+// MARK: - Agent selection
+
+/// Which agent fills a column in the AI Agents panel. Persisted so the left
+/// and right slots can be freely remapped among Claude / Codex / Cursor.
+enum AgentKind: String, CaseIterable, Identifiable, Sendable {
+    case claude = "claude"
+    case codex = "codex"
+    case cursor = "cursor"
+
+    var id: String { rawValue }
+
+    /// Short label for Settings / menu UI.
+    var displayName: String {
+        switch self {
+        case .claude: return "Claude"
+        case .codex:  return "Codex"
+        case .cursor: return "Cursor"
+        }
+    }
+
+    /// Column header drawn on the LCD.
+    var columnName: String {
+        switch self {
+        case .claude: return "CLAUDE"
+        case .codex:  return "CODEX"
+        case .cursor: return "CURSOR"
+        }
+    }
+
+    private static let leftKey = "agent.left"
+    private static let rightKey = "agent.right"
+
+    /// Left column — defaults to Cursor so it can be tried in Claude's old slot.
+    static var left: AgentKind {
+        get { AgentKind(rawValue: UserDefaults.standard.string(forKey: leftKey) ?? "") ?? .cursor }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: leftKey) }
+    }
+
+    /// Right column — defaults to Codex (unchanged).
+    static var right: AgentKind {
+        get { AgentKind(rawValue: UserDefaults.standard.string(forKey: rightKey) ?? "") ?? .codex }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: rightKey) }
+    }
+}
 
 // MARK: - Data Structures
 
@@ -30,6 +76,7 @@ struct AgentUsage: Sendable {
     let stepCurrent: Int?           // active plan step (1-based); nil = no plan
     let stepTotal: Int?             // total plan steps
     let stepText: String?           // description of the active step
+    let hasTokenUsage: Bool         // false when the source never writes tokens (Cursor)
     var todayTotalTokens: UInt64 { todayInputTokens + todayOutputTokens }
 
     init(available: Bool, todayInputTokens: UInt64, todayOutputTokens: UInt64,
@@ -37,7 +84,8 @@ struct AgentUsage: Sendable {
          quotaUsedPercent: Double? = nil, quotaResetsAt: Date? = nil,
          needsAttention: Bool = false, isWorking: Bool = false,
          waitingFor: String? = nil, model: String? = nil,
-         stepCurrent: Int? = nil, stepTotal: Int? = nil, stepText: String? = nil) {
+         stepCurrent: Int? = nil, stepTotal: Int? = nil, stepText: String? = nil,
+         hasTokenUsage: Bool = true) {
         self.available = available
         self.todayInputTokens = todayInputTokens
         self.todayOutputTokens = todayOutputTokens
@@ -53,12 +101,22 @@ struct AgentUsage: Sendable {
         self.stepCurrent = stepCurrent
         self.stepTotal = stepTotal
         self.stepText = stepText
+        self.hasTokenUsage = hasTokenUsage
     }
 }
 
 struct AgentsSnapshot: Sendable {
     let claude: AgentUsage
     let codex: AgentUsage
+    let cursor: AgentUsage
+
+    func usage(for kind: AgentKind) -> AgentUsage {
+        switch kind {
+        case .claude: return claude
+        case .codex:  return codex
+        case .cursor: return cursor
+        }
+    }
 }
 
 // MARK: - Collector
@@ -78,6 +136,9 @@ final class AgentUsageCollector: @unchecked Sendable {
     private var codexOffsets: [String: UInt64] = [:]
     private var codexInput: UInt64 = 0
     private var codexOutput: UInt64 = 0
+    // Cursor's agent-transcripts don't carry per-message token usage (those
+    // fields are zeroed in the IDE DB too), so we don't accumulate offsets —
+    // only activity/plan/model from the freshest transcript.
 
     // Attention edge tracking — flash only for the first N seconds after the
     // waiting/done state appears, not for as long as it persists
@@ -86,17 +147,22 @@ final class AgentUsageCollector: @unchecked Sendable {
     private var claudeAttentionSince: Date?
     private var codexPrevAttention = false
     private var codexAttentionSince: Date?
+    private var cursorPrevAttention = false
+    private var cursorAttentionSince: Date?
 
-    // Last-known Codex quota (account-global). The full rate-limit block appears only
-    // occasionally and the newest reading may be in a different file than the active
-    // one, so we track the newest-by-timestamp across recent files and cache it.
+    // Live Codex subscription quota from ChatGPT's wham/usage API (same source as
+    // the Codex client / `tokens codex status`). Session transcripts only carry
+    // a stale snapshot that can sit at 100% while the real weekly window is fine.
     private var codexQuotaCache: (used: Double, resets: Date?)?
-    private var codexQuotaTS = ""            // newest reading's timestamp seen so far
-    private var codexQuotaLastScan: Date?
+    private var codexQuotaLastFetch: Date?
+    private var codexQuotaInFlight = false
+    private let codexQuotaLock = NSLock()
 
     func collect() -> AgentsSnapshot {
         rolloverIfNeeded()
-        return AgentsSnapshot(claude: collectClaude(), codex: collectCodex())
+        return AgentsSnapshot(claude: collectClaude(),
+                              codex: collectCodex(),
+                              cursor: collectCursor())
     }
 
     /// Reset accumulators at local midnight. Timestamps in both formats are
@@ -455,16 +521,16 @@ final class AgentUsageCollector: @unchecked Sendable {
             }
         }
 
-        // Quota is account-global: the newest reading may live in a DIFFERENT session
-        // file than the most-recently-modified one, so scan across recent files by
-        // timestamp (throttled — it changes slowly).
+        // Live weekly quota from ChatGPT (async, throttled). See updateCodexQuota().
         updateCodexQuota()
 
         var project: String?
         var activity: String?
         var secondsAgo: Int?
+        codexQuotaLock.lock()
         let quotaUsed = codexQuotaCache?.used
         let quotaResets = codexQuotaCache?.resets
+        codexQuotaLock.unlock()
         var attention = false
         var working = false
         var model: String?
@@ -581,54 +647,93 @@ final class AgentUsageCollector: @unchecked Sendable {
             .replacingOccurrences(of: "\\\\", with: "\\")
     }
 
-    /// Refresh the cached quota from the NEWEST full rate-limit reading across recent
-    /// session files (by timestamp). Codex emits the populated `primary` block only
-    /// occasionally and the freshest one can be in a different file than the active
-    /// session, so a single-file tail scan is unreliable. Throttled since it changes
-    /// slowly; lines without a populated primary don't contain "used_percent" and are
-    /// rejected cheaply, so the reversed scan stops at each file's newest reading fast.
+    /// Refresh the weekly Codex subscription quota from ChatGPT's live API:
+    ///   GET https://chatgpt.com/backend-api/wham/usage
+    /// using the OAuth tokens in `~/.codex/auth.json` (same source as the Codex
+    /// client and `tokens codex status`). Session-file `rate_limits` blocks are
+    /// intentionally ignored — they lag the server and can show 100% used while
+    /// the real weekly window still has capacity (e.g. client shows 87% left).
+    ///
+    /// Network fetch is async + throttled (~60s). Until the first reply lands,
+    /// `codexQuotaCache` stays nil and the panel simply hides the quota bar.
     private func updateCodexQuota() {
-        if let last = codexQuotaLastScan, Date().timeIntervalSince(last) < 20,
-           codexQuotaCache != nil { return }
-        codexQuotaLastScan = Date()
+        codexQuotaLock.lock()
+        if let last = codexQuotaLastFetch, Date().timeIntervalSince(last) < 60 {
+            codexQuotaLock.unlock()
+            return
+        }
+        if codexQuotaInFlight {
+            codexQuotaLock.unlock()
+            return
+        }
+        codexQuotaInFlight = true
+        codexQuotaLock.unlock()
 
-        let root = home + "/.codex/sessions"
-        let df = DateFormatter(); df.dateFormat = "yyyy/MM/dd"
-        let cutoff = Date().addingTimeInterval(-3 * 86400)
-        for back in 0..<4 {
-            guard let day = Calendar.current.date(byAdding: .day, value: -back, to: Date())
-            else { continue }
-            let dir = root + "/" + df.string(from: day)
-            for file in (try? fm.contentsOfDirectory(atPath: dir)) ?? [] {
-                guard file.hasSuffix(".jsonl") else { continue }
-                let path = dir + "/" + file
-                guard let attrs = try? fm.attributesOfItem(atPath: path),
-                      let mtime = attrs[.modificationDate] as? Date, mtime >= cutoff
-                else { continue }
-                // First (newest) populated reading in this file; update global if newer
-                guard let line = lastLine(path: path, containing: "used_percent"),
-                      let obj = parseJSON(line),
-                      let ts = obj["timestamp"] as? String,
-                      let payload = obj["payload"] as? [String: Any],
-                      let limits = payload["rate_limits"] as? [String: Any],
-                      let primary = limits["primary"] as? [String: Any],
-                      let used = (primary["used_percent"] as? NSNumber)?.doubleValue
-                else { continue }
-                if ts > codexQuotaTS {
-                    codexQuotaTS = ts
-                    var resets: Date?
-                    if let r = (primary["resets_at"] as? NSNumber)?.doubleValue {
-                        resets = Date(timeIntervalSince1970: r)
-                    }
-                    codexQuotaCache = (used, resets)
-                }
+        // Snapshot auth on this thread (FileManager is fine off-main).
+        let authPath = home + "/.codex/auth.json"
+        guard let data = fm.contents(atPath: authPath),
+              let auth = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let tokens = auth["tokens"] as? [String: Any],
+              let access = tokens["access_token"] as? String, !access.isEmpty
+        else {
+            codexQuotaLock.lock()
+            codexQuotaInFlight = false
+            codexQuotaLastFetch = Date()   // back off even on missing auth
+            codexQuotaLock.unlock()
+            return
+        }
+        let accountID = tokens["account_id"] as? String ?? ""
+
+        // Fire-and-forget on a utility queue so the metrics loop never blocks
+        // on the network. Result is published into codexQuotaCache under lock.
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            defer {
+                self?.codexQuotaLock.lock()
+                self?.codexQuotaInFlight = false
+                self?.codexQuotaLastFetch = Date()
+                self?.codexQuotaLock.unlock()
             }
+            guard let self else { return }
+            guard let url = URL(string: "https://chatgpt.com/backend-api/wham/usage")
+            else { return }
+            var req = URLRequest(url: url, timeoutInterval: 12)
+            req.setValue("Bearer \(access)", forHTTPHeaderField: "Authorization")
+            req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+                         forHTTPHeaderField: "User-Agent")
+            req.setValue("application/json", forHTTPHeaderField: "Accept")
+            if !accountID.isEmpty {
+                req.setValue(accountID, forHTTPHeaderField: "ChatGPT-Account-Id")
+            }
+            let sem = DispatchSemaphore(value: 0)
+            var body: Data?
+            URLSession.shared.dataTask(with: req) { data, _, _ in
+                body = data
+                sem.signal()
+            }.resume()
+            // Cap wait so a hung request can't pin the utility thread forever
+            _ = sem.wait(timeout: .now() + 15)
+            guard let body,
+                  let obj = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any],
+                  let rate = obj["rate_limit"] as? [String: Any],
+                  let primary = rate["primary_window"] as? [String: Any],
+                  let used = (primary["used_percent"] as? NSNumber)?.doubleValue
+            else { return }
+            var resets: Date?
+            if let r = (primary["reset_at"] as? NSNumber)?.doubleValue {
+                resets = Date(timeIntervalSince1970: r)
+            } else if let after = (primary["reset_after_seconds"] as? NSNumber)?.doubleValue {
+                resets = Date().addingTimeInterval(after)
+            }
+            self.codexQuotaLock.lock()
+            self.codexQuotaCache = (used, resets)
+            self.codexQuotaLock.unlock()
         }
     }
 
-    /// Sum per-request deltas (`last_token_usage`), NOT `total_token_usage`:
-    /// forked/subagent sessions inherit the parent's cumulative totals, which
-    /// would massively overcount today.
+    /// Sum per-request deltas (`last_token_usage`), NOT `total_token_usage`.
+    /// `input_tokens` already includes the cached prefix of the context window
+    /// (this is the historical MacTR / tokens-service style total — full context
+    /// seen each turn, not "new tokens only").
     private func accumulateCodexLine(_ line: String) {
         guard let obj = parseJSON(line),
               let ts = obj["timestamp"] as? String, ts >= todayStartISO,
@@ -710,6 +815,300 @@ final class AgentUsageCollector: @unchecked Sendable {
         }
         let activity = message ?? reasoning
         return (project, activity, attention)
+    }
+
+    // MARK: - Cursor
+
+    /// Cursor agent transcripts live at
+    /// `~/.cursor/projects/<proj>/agent-transcripts/<uuid>/<uuid>.jsonl`.
+    /// Each line is either a `{role, message}` turn (Claude-shaped content
+    /// blocks) or a `{type:"turn_ended", status}` marker.
+    ///
+    /// Per-message token totals are zeroed even in Cursor's IDE DB, so the
+    /// "今日 Token" number stays blank. What we *can* surface is the active
+    /// conversation's `contextUsagePercent` from
+    /// `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb`
+    /// (composerHeaders) — shown as the bottom quota-style bar.
+    private func collectCursor() -> AgentUsage {
+        let root = home + "/.cursor/projects"
+        guard fm.fileExists(atPath: root) else {
+            return AgentUsage(available: false, todayInputTokens: 0, todayOutputTokens: 0,
+                              secondsSinceActive: nil, project: nil, activity: nil)
+        }
+
+        var latestPath: String?
+        var latestMtime = Date.distantPast
+        var latestProject: String?
+        var latestSessionID: String?
+
+        for projDir in (try? fm.contentsOfDirectory(atPath: root)) ?? [] {
+            // Skip housekeeping markers like `.agent-data-cleanup-…`
+            if projDir.hasPrefix(".") { continue }
+            let transcripts = root + "/" + projDir + "/agent-transcripts"
+            guard fm.fileExists(atPath: transcripts) else { continue }
+            for sid in (try? fm.contentsOfDirectory(atPath: transcripts)) ?? [] {
+                // Prefer the primary transcript over subagent side chains
+                let path = transcripts + "/" + sid + "/" + sid + ".jsonl"
+                guard let attrs = try? fm.attributesOfItem(atPath: path),
+                      let mtime = attrs[.modificationDate] as? Date
+                else { continue }
+                if mtime > latestMtime {
+                    latestMtime = mtime
+                    latestPath = path
+                    latestProject = projDir
+                    latestSessionID = sid
+                }
+            }
+        }
+
+        var project: String?
+        var activity: String?
+        var secondsAgo: Int?
+        var attention = false
+        var working = false
+        var model: String?
+        var step: (current: Int, total: Int, text: String)?
+        var contextUsed: Double?
+
+        if let path = latestPath {
+            let ago = max(0, Int(Date().timeIntervalSince(latestMtime)))
+            secondsAgo = ago
+            let rawWaiting: Bool
+            (project, activity, rawWaiting, step, model) = cursorActivity(path: path)
+            // Project dir is encoded as `Users-ming-Documents-foo` — fall back to
+            // the last path segment of that slug when the transcript itself has
+            // no cwd (Cursor doesn't write one).
+            if project == nil, let slug = latestProject {
+                project = cursorProjectName(from: slug)
+            }
+            // Same 90s "still writing" / 900s "recently done" windows as Codex
+            working = !rawWaiting && ago < 90
+            attention = rawWaiting && ago < 900
+            if attention && !cursorPrevAttention { cursorAttentionSince = Date() }
+            cursorPrevAttention = attention
+            if attention, let since = cursorAttentionSince,
+               Date().timeIntervalSince(since) >= flashDuration {
+                attention = false
+            }
+            // Context-window fill of the active composer (not a daily token total)
+            contextUsed = cursorContextUsage(sessionID: latestSessionID)
+            if model == nil {
+                model = cursorModelFromTracking(sessionID: latestSessionID)
+            }
+        }
+
+        return AgentUsage(available: true, todayInputTokens: 0, todayOutputTokens: 0,
+                          secondsSinceActive: secondsAgo,
+                          project: project, activity: activity,
+                          // Reuse the quota bar as "context used %" — label is
+                          // overridden in the renderer when hasTokenUsage is false.
+                          quotaUsedPercent: contextUsed,
+                          needsAttention: attention, isWorking: working,
+                          model: model,
+                          stepCurrent: step?.current, stepTotal: step?.total,
+                          stepText: step?.text,
+                          hasTokenUsage: false)
+    }
+
+    /// `contextUsagePercent` of the matching (or newest) composer header in
+    /// Cursor's state.vscdb. Cheap: one SQLite read of the small composerHeaders
+    /// table. Returns nil when Cursor isn't installed or the table is empty.
+    private func cursorContextUsage(sessionID: String?) -> Double? {
+        let dbPath = home
+            + "/Library/Application Support/Cursor/User/globalStorage/state.vscdb"
+        guard fm.fileExists(atPath: dbPath) else { return nil }
+        // sqlite3 CLI is always present on macOS; avoids linking libsqlite.
+        // Prefer the row whose composerId matches the active transcript, else
+        // the most recently updated non-draft header with a context figure.
+        // Two single-line queries (Process passes one arg; multi-statement /
+        // UNION…ORDER BY on a single-column projection fails in sqlite3).
+        var candidates: [String] = []
+        if let sid = sessionID, sid.allSatisfy({ $0.isHexDigit || $0 == "-" }) {
+            candidates.append(
+                "SELECT value FROM composerHeaders WHERE composerId = '\(sid)' LIMIT 1;")
+        }
+        candidates.append(
+            "SELECT value FROM composerHeaders ORDER BY COALESCE(lastUpdatedAt, recency) DESC LIMIT 8;")
+        for sql in candidates {
+            guard let out = runSQLite(db: dbPath, sql: sql) else { continue }
+            for line in out.split(separator: "\n", omittingEmptySubsequences: true) {
+                guard let obj = parseJSON(String(line)) else { continue }
+                if obj["isDraft"] as? Bool == true { continue }
+                if obj["isEphemeral"] as? Bool == true { continue }
+                if let pct = (obj["contextUsagePercent"] as? NSNumber)?.doubleValue {
+                    return pct
+                }
+            }
+        }
+        return nil
+    }
+
+    /// Best-effort model id from `~/.cursor/ai-tracking/ai-code-tracking.db`
+    /// (rows written when Cursor applies code). Filtered by conversationId when
+    /// we know it; otherwise the most recent row overall.
+    private func cursorModelFromTracking(sessionID: String?) -> String? {
+        let dbPath = home + "/.cursor/ai-tracking/ai-code-tracking.db"
+        guard fm.fileExists(atPath: dbPath) else { return nil }
+        let sql: String
+        if let sid = sessionID, sid.allSatisfy({ $0.isHexDigit || $0 == "-" }) {
+            sql = """
+            SELECT model FROM ai_code_hashes
+            WHERE conversationId = '\(sid)' AND model IS NOT NULL AND model != ''
+            ORDER BY timestamp DESC LIMIT 1;
+            """
+        } else {
+            sql = """
+            SELECT model FROM ai_code_hashes
+            WHERE model IS NOT NULL AND model != ''
+            ORDER BY timestamp DESC LIMIT 1;
+            """
+        }
+        guard let out = runSQLite(db: dbPath, sql: sql) else { return nil }
+        let model = out.trimmingCharacters(in: .whitespacesAndNewlines)
+        return model.isEmpty ? nil : model
+    }
+
+    /// Run a read-only SQL query via `/usr/bin/sqlite3`. Returns stdout, or nil
+    /// on any failure. Kept process-free of network; the DBs are local only.
+    private func runSQLite(db: String, sql: String) -> String? {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
+        // -readonly ensures we never lock Cursor out of its own DB
+        proc.arguments = ["-readonly", db, sql]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = Pipe()
+        do {
+            try proc.run()
+            proc.waitUntilExit()
+        } catch {
+            return nil
+        }
+        guard proc.terminationStatus == 0 else { return nil }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        return String(data: data, encoding: .utf8)
+    }
+
+    /// Decode `Users-ming-Documents-ad-test-mini` → `ad-test-mini`. Best-effort:
+    /// take the last path-ish segment after common home prefixes.
+    private func cursorProjectName(from slug: String) -> String {
+        // Common encoding: absolute path with `/` → `-`
+        // e.g. Users-ming-Documents-foo-bar → foo-bar
+        let markers = ["Users-\(NSUserName())-Documents-",
+                       "Users-\(NSUserName())-",
+                       "home-\(NSUserName())-"]
+        for m in markers {
+            if let r = slug.range(of: m) {
+                let rest = String(slug[r.upperBound...])
+                if !rest.isEmpty { return rest }
+            }
+        }
+        // Fall back to the last 2 dash-separated tokens if the slug is long
+        let parts = slug.split(separator: "-")
+        if parts.count >= 2 { return parts.suffix(2).joined(separator: "-") }
+        return slug
+    }
+
+    /// Tail of a Cursor transcript → project, last assistant text, attention,
+    /// TodoWrite plan, model. Attention: a trailing `turn_ended` means the
+    /// agent is waiting for the user; a trailing tool_use without one means
+    /// it's still mid-turn.
+    private func cursorActivity(path: String)
+        -> (project: String?, activity: String?, attention: Bool,
+            step: (current: Int, total: Int, text: String)?, model: String?) {
+        var message: String?
+        var attention = false
+        var stateDetermined = false
+        var crossedUserTurn = false
+        var step: (Int, Int, String)?
+        var model: String?
+
+        for line in tailLines(path: path, maxBytes: 256 * 1024).reversed() {
+            // turn_ended is the clean "your turn" marker Cursor writes
+            if line.contains("\"turn_ended\"") {
+                if let obj = parseJSON(line), obj["type"] as? String == "turn_ended" {
+                    if !stateDetermined {
+                        attention = true
+                        stateDetermined = true
+                    }
+                }
+                continue
+            }
+
+            let isAssistant = line.contains("\"role\":\"assistant\"")
+            let isUser = line.contains("\"role\":\"user\"")
+            guard isAssistant || isUser, let obj = parseJSON(line) else { continue }
+
+            if isUser, obj["role"] as? String == "user" {
+                crossedUserTurn = true
+                if !stateDetermined {
+                    // User already spoke after the agent → not waiting
+                    attention = false
+                    stateDetermined = true
+                }
+                continue
+            }
+
+            guard obj["role"] as? String == "assistant",
+                  let msg = obj["message"] as? [String: Any]
+            else { continue }
+
+            if model == nil, let m = msg["model"] as? String { model = m }
+
+            var sawToolUse = false
+            if let content = msg["content"] as? [[String: Any]] {
+                for block in content {
+                    switch block["type"] as? String {
+                    case "tool_use":
+                        sawToolUse = true
+                        if step == nil, !crossedUserTurn,
+                           block["name"] as? String == "TodoWrite",
+                           let input = block["input"] as? [String: Any],
+                           let todos = input["todos"] as? [[String: Any]] {
+                            // Cursor uses the same TodoWrite shape as Claude
+                            step = parseClaudeTodos(todos)
+                        }
+                    case "text":
+                        if message == nil {
+                            let t = cleanMultiline(block["text"] as? String ?? "")
+                            // Strip the synthetic <timestamp>…</timestamp> /
+                            // <user_query> wrappers Cursor injects into some
+                            // user-echoed text so the panel shows real prose.
+                            let stripped = stripCursorWrappers(t)
+                            if !stripped.isEmpty { message = stripped }
+                        }
+                    default:
+                        break
+                    }
+                }
+            }
+
+            if !stateDetermined {
+                // No turn_ended yet: tool_use → still working; text-only → done
+                attention = !sawToolUse
+                stateDetermined = true
+            }
+
+            if message != nil && stateDetermined && (step != nil || crossedUserTurn) {
+                break
+            }
+        }
+        return (nil, message, attention, step, model)
+    }
+
+    /// Drop Cursor's synthetic XML wrappers so the panel shows the real text.
+    private func stripCursorWrappers(_ s: String) -> String {
+        var t = s
+        // <timestamp>…</timestamp> and <user_query>…</user_query>
+        if let re = try? NSRegularExpression(
+            pattern: "</?(timestamp|user_query|system_reminder)[^>]*>",
+            options: [.caseInsensitive]
+        ) {
+            t = re.stringByReplacingMatches(
+                in: t, range: NSRange(location: 0, length: (t as NSString).length),
+                withTemplate: "")
+        }
+        return t.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// Pull a JSON string value by key via substring scan — cheaper than parsing,

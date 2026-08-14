@@ -34,6 +34,9 @@ enum Color {
     static let magenta = CGColor(red: 217/255, green: 70/255, blue: 239/255, alpha: 1)
     static let magentaD = CGColor(red: 80/255, green: 28/255, blue: 90/255, alpha: 1)
     static let claude = CGColor(red: 217/255, green: 119/255, blue: 87/255, alpha: 1)  // Claude brand terracotta
+    // Cursor monochrome: near-white primary on the dark panel (Cursor's own UI is B/W)
+    static let cursor = CGColor(red: 235/255, green: 235/255, blue: 240/255, alpha: 1)
+    static let cursorDim = CGColor(red: 140/255, green: 142/255, blue: 150/255, alpha: 1)
 
     static let barBG = CGColor(red: 30/255, green: 34/255, blue: 48/255, alpha: 1)
 
